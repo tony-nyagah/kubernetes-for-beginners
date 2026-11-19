@@ -4,12 +4,12 @@ metadata:
   name: myapp-deployment
   labels:
     tier: frontend
-    app: caddy
+    app: myapp
 spec:
   selector:
     matchLabels:
       app: myapp
-  replicas: 3
+  replicas: 6
   template:
     metadata:
         name: caddy
@@ -18,4 +18,4 @@ spec:
     spec:
       containers:
         - name: caddy
-          image: caddy
+          image: caddy:2.11.8

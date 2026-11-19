@@ -13,6 +13,7 @@ Personal notes following KodeKloud's *Kubernetes for the Absolute Beginners* cou
 7. [YAML Introduction](#7-yaml-introduction)
 8. [Pods with YAML](#8-pods-with-yaml)
 9. [Replication Controllers and ReplicaSets](#9-replication-controllers-and-replicasets)
+10. [Deployments](#10-deployments)
 
 ---
 
@@ -128,7 +129,7 @@ Every Kubernetes definition file has four top-level required fields:
 | `metadata` | Data about the object (name, labels) | dict |
 | `spec` | Desired specification (containers, etc.) | dict |
 
-Example: [`nginx.yaml`](nginx.yaml)
+Example: `nginx.yaml`
 
 ```yaml
 apiVersion: v1
@@ -180,7 +181,7 @@ kubectl edit pod nginx-2          # edit a running pod
 
 ### Replication Controller definition
 
-Example: [`rc-definition.yaml`](rc-definition.yaml)
+Example: `rc-definition.yaml`
 
 ```yaml
 apiVersion: v1
@@ -218,7 +219,7 @@ kubectl get pods                       # pods are named myapp-rc-xxxxx
 
 ### ReplicaSet definition
 
-Example: [`replicaset-definition.yaml`](replicaset-definition.yaml)
+Example: [`replicasets/replicaset.yaml`](replicasets/replicaset.yaml)
 
 ```yaml
 apiVersion: apps/v1
@@ -293,3 +294,179 @@ Tip: delete one of the pods and run `kubectl get pods` again. The RS creates a r
 - Both keep a set number of pods running (self-healing, scaling, load balancing).
 - **ReplicaSet** is the modern replacement and adds a required label `selector`, which allows it to manage pods created outside it.
 - In practice you rarely create ReplicaSets directly. **Deployments** (a later topic) manage ReplicaSets for you.
+
+---
+
+## 10. Deployments
+
+> Covers Deployments and the start of update/rollback. Rolling update demo and lab are still to do.
+
+### Why Deployments?
+
+A real app in production needs more than just running pods:
+- Many instances running for availability and load.
+- **Upgrade** the app smoothly (new image versions) without taking it down. Replacing all instances at once would cause downtime and a bad version would hit all users.
+- **Roll back** quickly if a new version has problems.
+- Make several changes (image, replicas, resources) and apply them together: **pause**, then **resume**.
+
+A **Deployment** sits above the ReplicaSet and provides all of this.
+
+```
+Deployment
+  └── ReplicaSet
+        └── Pods
+```
+
+### Deployment definition
+
+Example: [`deployments/deployment.yaml`](deployments/deployment.yaml)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-deployment
+  labels:
+    tier: frontend
+    app: caddy
+spec:
+  selector:
+    matchLabels:
+      app: myapp
+  replicas: 3
+  template:
+    metadata:
+      name: caddy
+      labels:
+        app: myapp
+    spec:
+      containers:
+        - name: caddy
+          image: caddy:2.11.8
+```
+
+- Identical to a ReplicaSet definition except `kind: Deployment`.
+- `selector.matchLabels` must match the pod `template.metadata.labels`.
+- Pin an image **tag** (e.g. `caddy:2.11.8`) instead of relying on `latest`, so updates and rollbacks are predictable.
+
+### Commands
+
+```bash
+kubectl create -f deployments/deployment.yaml
+kubectl get deployments            # or: kubectl get deploy
+kubectl get replicaset             # the Deployment created this automatically
+kubectl get pods                   # named <deployment>-<rs-hash>-<pod-hash>
+kubectl get all                    # deployment, replicaset and pods together
+kubectl describe deployment myapp-deployment
+
+# Generate a YAML template quickly
+kubectl create deployment caddy --image=caddy:2.11.8 --replicas=3 --dry-run=client -o yaml > deployment.yaml
+```
+
+### Updates and rollouts
+
+- Creating a deployment triggers a **rollout**, which creates a new **revision** (revision 1).
+- Changing the deployment (e.g. a new image version) triggers a new rollout and revision (revision 2). This lets you roll back.
+
+```bash
+kubectl rollout status deployment/myapp-deployment      # watch progress
+kubectl rollout history deployment/myapp-deployment     # list revisions
+```
+
+### Deployment strategies
+
+| Strategy | How it works |
+|---|---|
+| **Recreate** | Destroy all old pods, then create all new ones. Causes **downtime**. |
+| **RollingUpdate** (default) | Take down old pods and bring up new ones **one at a time**. App stays available. |
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate     # or Recreate
+```
+
+You can see this in `kubectl describe deployment`: the Deployment scales the **new ReplicaSet up** and the **old one down** gradually. With Recreate, the old ReplicaSet is scaled to 0 first.
+
+### Updating a deployment
+
+```bash
+# Option 1: edit the file, then apply (preferred, keeps the file as source of truth)
+kubectl apply -f deployments/deployment.yaml
+
+# Option 2: change the image directly (file becomes out of date!)
+kubectl set image deployment/myapp-deployment caddy=caddy:2.11.9
+
+# Option 3: edit the live object
+kubectl edit deployment myapp-deployment
+```
+
+- In `set image`, the part before `=` is the **container name**, not the image name.
+- During an update a **second ReplicaSet** is created. The old one is kept with 0 pods, which is what makes rollback possible.
+
+### Recording the change cause
+
+`kubectl rollout history` has a `CHANGE-CAUSE` column that shows `<none>` unless the `kubernetes.io/change-cause` annotation is set. The old `--record` flag did this automatically but is **deprecated**.
+
+```bash
+# set it right after a change (it's stamped on the current revision)
+kubectl annotate deployment/myapp-deployment kubernetes.io/change-cause="update caddy to 2.11.9"
+```
+
+Or in the YAML, so it's recorded on every `apply`:
+
+```yaml
+metadata:
+  name: myapp-deployment
+  annotations:
+    kubernetes.io/change-cause: "caddy 2.11.9"
+```
+
+More detail on revisions:
+
+```bash
+kubectl rollout history deployment/myapp-deployment --revision=2   # image, labels for that revision
+kubectl get rs                                                     # one ReplicaSet per revision
+kubectl describe deployment myapp-deployment                       # events show old/new RS scaling
+```
+
+**Revision numbers can jump or disappear.** If a new pod template matches an older ReplicaSet (e.g. after a rollback or re-applying an old image), Kubernetes reuses that ReplicaSet and gives it the **next** revision number, so the old number vanishes (history like `1, 4, 5` becomes `1, 5, 6`).
+
+### Rollback
+
+```bash
+kubectl rollout undo deployment/myapp-deployment                 # previous revision
+kubectl rollout undo deployment/myapp-deployment --to-revision=1 # specific revision
+```
+
+After a rollback the old ReplicaSet scales back up and the new one goes to 0.
+
+### Pause and resume
+
+```bash
+kubectl rollout pause deployment/myapp-deployment
+# make several changes (image, resources, ...) without triggering rollouts
+kubectl rollout resume deployment/myapp-deployment
+```
+
+### Summary of commands
+
+| Task | Command |
+|---|---|
+| Create | `kubectl create -f file.yaml` |
+| Get | `kubectl get deployments` |
+| Update | `kubectl apply -f file.yaml` / `kubectl set image ...` |
+| Status | `kubectl rollout status deployment/<name>` |
+| History | `kubectl rollout history deployment/<name>` |
+| Rollback | `kubectl rollout undo deployment/<name>` |
+
+### Gotchas
+
+- In `kubectl set image deployment/<name> <container>=<image>`, `<container>` is the **container name** from the YAML (`caddy`), not the image or deployment name. A wrong name gives `unable to find container named "..."`.
+- A typo in the deployment name gives `NotFound`. Check with `kubectl get deploy`.
+- `connection refused ... 127.0.0.1:6443` means the cluster isn't running, not a YAML problem. On k3s: `sudo systemctl start k3s`, and set `KUBECONFIG=/etc/rancher/k3s/k3s.yaml` if kubectl can't find the config.
+
+### TODO
+
+- [ ] Demo: Deployments - Update and Rollback (hands-on notes)
+- [ ] Lab: Practice Test Rolling Updates and Rollbacks
